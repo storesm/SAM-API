@@ -1,0 +1,12 @@
+Cosas que necesito enviar a la API:
+    * Cosas que no tienen que tener efecto: 
+        - Qué SAM usar (el de Keras, el de MiSAM, el de HuggingFace, etc).
+
+    * Cosas que tienen que tener efecto:
+        - Qué size debe tener SAM
+        - La imagen 
+        - Los inputs (puntos positivos/negativos y cajas)
+
+
+Cosas que necesito recibir de la API:
+- La máscara
