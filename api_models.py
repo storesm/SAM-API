@@ -1,4 +1,5 @@
 from typing import List, Optional, Union
+from fastapi import File, UploadFile
 from pydantic import BaseModel, field_validator
 
 
@@ -14,19 +15,19 @@ class SAMModel(BaseModel):
 
 
 class RectInput(BaseModel):
-    startX: float
-    startY: float
-    width: float
-    height: float
+    startX: Union[float, int]
+    startY: Union[float, int]
+    width: Union[float, int]
+    height: Union[float, int]
 
 
 class PointInput(BaseModel):
-    x: int
-    y: int
+    x: Union[float, int]
+    y: Union[float, int]
 
 
 class SAMInput(BaseModel):
-    model: Optional[SAMModel]
+    model: Optional[str]
     rectangles: Optional[List[RectInput]]
     positive_points: Optional[List[PointInput]]
     negative_points: Optional[List[PointInput]]

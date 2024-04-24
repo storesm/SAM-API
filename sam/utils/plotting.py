@@ -48,14 +48,15 @@ def show_image(figSize, image, masks, input_box, input_point, input_label):
     plt.imshow(image)
     if masks is not None:
         show_mask(masks[0], plt.gca())
-    show_box(input_box, plt.gca())
+    if input_box is not None:
+        show_box(input_box, plt.gca())
     show_points(input_point, input_label, plt.gca())
     plt.axis("off")
     plt.show()
 
 
 def show_raw_image(figSize, image):
-    plt.figure(figsize=(10, 10))
+    plt.figure(figsize=figSize)
     plt.imshow(image)
     plt.axis("on")
     plt.show()
