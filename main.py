@@ -12,11 +12,12 @@ from fastapi import FastAPI, Form, Response, UploadFile, File
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse
 import numpy as np
-from api_models import Item, SAMInput
+from models.api_models import Item, SAMInput
 from fastapi.middleware.cors import CORSMiddleware
-import os
-import cv2
+
 import matplotlib.pyplot as plt
+from preprocessing import decode_image, decode_inputs, format_inputs_to_sam
+from sam.sam import sam_execution
 from sam.utils.plotting import show_image, show_raw_image
 
 app = FastAPI()
@@ -51,39 +52,21 @@ def update_item(item_id: int, item: Item):
     return {"item_name": item.name, "item_id": item_id}
 
 
-# Base de datos simulada de sesiones de usuario
-sessions_db = {}
-
-
-def save_image(file, sessionID):
-    # Guardar la imagen
-    with open(f"images/{sessionID}.png", "wb") as buffer:
-        buffer.write(file)
-
-
-@app.post("/get_image_and_parameters/{sessionID}")
+@app.post("/get_image_and_parameters/")
 async def get_image_and_parameters(
-    sessionID: str,
     file: UploadFile = File(...),
     sam_input: str = Form(...),
 ):
     sam_input = json.loads(sam_input)
 
-    # Preprocesar la imagen sin guardarla en disco
-    image = cv2.imdecode(np.frombuffer(await file.read(), np.uint8), cv2.IMREAD_COLOR)
+    image = await decode_image(file)
+    print("imagen shape: ", image.shape)
 
-    # Get all the positive_points in sam_input
-    print("Printing each value in SAMInput")
-    for key, value in sam_input.items():
-        print(key, value)
+    positive_points, negative_points, input_box = decode_inputs(sam_input)
 
-    positive_points = np.array(
-        [[point["x"], point["y"]] for point in sam_input["positive_points"]]
-    )
+    input_points, input_labels = format_inputs_to_sam(positive_points, negative_points)
 
-    input_point = positive_points
-    input_label = np.array([0, 0])
+    masks = sam_execution(image, input_box, input_points, input_labels, verbose=True)
 
-    show_image((10, 8), image, None, None, input_point, input_label)
-
-    print(f"images/{sessionID}.png")
+    # Return the mask to the client
+    return {"masks": masks.tolist()}
