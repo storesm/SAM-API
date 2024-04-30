@@ -1,6 +1,7 @@
 import base64
 from http.client import HTTPException
 from io import BytesIO
+import io
 import json
 from pathlib import Path
 import re
@@ -8,9 +9,10 @@ import time
 from typing import Union
 import uuid
 
+import cv2
 from fastapi import FastAPI, Form, Response, UploadFile, File
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 import numpy as np
 from models.api_models import Item, SAMInput
 from fastapi.middleware.cors import CORSMiddleware
@@ -68,5 +70,34 @@ async def get_image_and_parameters(
 
     masks = sam_execution(image, input_box, input_points, input_labels, verbose=True)
 
-    # Return the mask to the client
-    return {"masks": masks.tolist()}
+    # # Return the mask to the client
+    # return {"masks": masks.tolist()}
+    # Superponer la máscara en la imagen original
+    overlaid_image = overlay_mask(image, masks)
+
+    # Codificar la imagen resultante en formato PNG
+    img_bytes = encode_image(overlaid_image)
+
+    # Devolver la imagen al cliente
+    return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+
+
+def overlay_mask(image, masks):
+    overlaid_image = np.copy(image)
+    if masks is not None:
+        # Convertir la matriz de máscara a una imagen binaria
+        mask_image = np.uint8(masks[0] * 255)
+        # Aplicar la máscara a la imagen original
+        overlaid_image[mask_image != 0] = [
+            0,
+            0,
+            255,
+        ]  # Color rojo para las áreas de la máscara
+    return overlaid_image
+
+
+def encode_image(image):
+    buffer = io.BytesIO()
+    plt.imsave(buffer, image, format="png")
+    img_bytes = buffer.getvalue()
+    return img_bytes
