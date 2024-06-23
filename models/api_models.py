@@ -9,11 +9,6 @@ class Item(BaseModel):
     is_offer: Union[bool, None] = None
 
 
-class SAMModel(BaseModel):
-    value: str
-    label: str
-
-
 class RectInput(BaseModel):
     startX: Union[float, int]
     startY: Union[float, int]

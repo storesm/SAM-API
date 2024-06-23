@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import re
 import time
-from tkinter import Image
 from typing import Union
 import uuid
 
@@ -27,10 +26,9 @@ import pydicom
 from pydicom.dataset import Dataset, FileDataset
 from pydicom.uid import ExplicitVRLittleEndian
 
-
 app = FastAPI()
 
-# Configuración de los origenes permitidos para CORS
+# Configuración de los orígenes permitidos para CORS
 origins = [
     "http://localhost",
     "http://localhost:3000",
@@ -67,9 +65,6 @@ async def segment_input_image(
     # Execute the SAM model
     masks = sam_execution(image, input_box, input_points, input_labels, verbose=False)
 
-    # # Return the mask to the client
-    # return {"masks": masks.tolist()}
-
     overlaid_image = overlay_mask(image, masks)
 
     # Codificar la imagen resultante en formato PNG
@@ -93,57 +88,88 @@ async def segment_input_image(
     np.save(masks_path, masks)
 
     # Utiliza la función para guardar el archivo DICOM
-    output_dicom_path = "output.dcm"
+    output_dicom_path = f"log/output_{now}.dcm"
     save_dicom_from_image(overlaid_image, output_dicom_path)
 
-    # Devolver la imagen al cliente
-    return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+    # Guardar la imagen PNG en un archivo temporal
+    segmented_image_path = f"log/segmented_image_{now}.png"
+    with open(segmented_image_path, "wb") as f:
+        f.write(img_bytes)
 
+    # Devolver solo el timestamp
+    return {"timestamp": now}
+
+@app.get("/get_segmented_image/{timestamp}")
+async def get_segmented_image(timestamp: float):
+    segmented_image_path = f"log/segmented_image_{timestamp}.png"
+    if Path(segmented_image_path).exists():
+        return FileResponse(segmented_image_path, media_type="image/png", filename=f"segmented_image_{timestamp}.png")
+    else:
+        raise HTTPException(status_code=404, detail="Segmented image not found")
+
+@app.get("/get_dicom_image/{timestamp}")
+async def get_dicom_image(timestamp: float):
+    output_dicom_path = f"log/output_{timestamp}.dcm"
+    if Path(output_dicom_path).exists():
+        return FileResponse(output_dicom_path, media_type="application/dicom", filename=f"output_{timestamp}.dcm")
+    else:
+        raise HTTPException(status_code=404, detail="DICOM file not found")
 
 def save_dicom_from_image(image_array, output_path):
-    # Convertir la imagen a escala de grises si es a color
-    if len(image_array.shape) == 3:
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_BGR2GRAY)
-
+    # Verificar si la imagen es a color
+    if len(image_array.shape) == 3 and image_array.shape[2] == 3:
+        # Convertir la imagen a RGB
+        image_array = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
+    
     # Escalar los píxeles para que estén en el rango adecuado para DICOM
-    image_array = cv2.normalize(image_array, None, 0, 65535, cv2.NORM_MINMAX)
+    image_array = cv2.normalize(image_array, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
     # Crear un nuevo conjunto de datos DICOM
-    ds = FileDataset(output_path, {}, file_meta=Dataset())
+    file_meta = Dataset()
+    file_meta.MediaStorageSOPClassUID = pydicom.uid.SecondaryCaptureImageStorage
+    file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+
+    ds = FileDataset(output_path, {}, file_meta=file_meta, preamble=b"\0" * 128)
 
     # Información del paciente y del estudio
     ds.PatientName = "John Doe"
     ds.PatientID = "123456"
-    ds.StudyInstanceUID = str(uuid.uuid4())
-    ds.SeriesInstanceUID = str(uuid.uuid4())
+    ds.StudyInstanceUID = pydicom.uid.generate_uid()
+    ds.SeriesInstanceUID = pydicom.uid.generate_uid()
+    ds.SOPInstanceUID = pydicom.uid.generate_uid()
+    ds.Modality = "OT"  # Other
+    ds.StudyDate = time.strftime("%Y%m%d")
+    ds.StudyTime = time.strftime("%H%M%S")
+    ds.ContentDate = time.strftime("%Y%m%d")
+    ds.ContentTime = time.strftime("%H%M%S")
 
-    # Establecer el tipo de archivo DICOM
-    ds.file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
-
-    # Crear píxeles de la imagen
-    ds.Rows, ds.Columns = image_array.shape
+    # Establecer dimensiones de la imagen
+    ds.SamplesPerPixel = 3
+    ds.PhotometricInterpretation = "RGB"
+    ds.Rows, ds.Columns, _ = image_array.shape
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.PixelRepresentation = 0
+    ds.PlanarConfiguration = 0
     ds.PixelData = image_array.tobytes()
 
     # Guardar el archivo DICOM
     ds.save_as(output_path)
 
-
 def overlay_mask(image, masks):
     overlaid_image = np.copy(image)
     if masks is not None:
-        # Convertir la matriz de máscara a una imagen binaria
+        # Crear una imagen binaria de la máscara
         mask_image = np.uint8(masks[0] * 255)
-        # Aplicar la máscara a la imagen original
-        overlaid_image[mask_image != 0] = [
-            0,
-            0,
-            255,
-        ]  # Color rojo para las áreas de la máscara
+        # Crear una imagen de color rojo para la máscara
+        red_image = np.zeros_like(image)
+        red_image[:, :] = [0, 0, 255]
+        # Superponer la imagen roja sobre la imagen original donde la máscara no es cero
+        overlaid_image = np.where(mask_image[:, :, None] != 0, red_image, overlaid_image)
     return overlaid_image
 
-
 def encode_image(image):
-    buffer = io.BytesIO()
-    plt.imsave(buffer, image, format="png")
-    img_bytes = buffer.getvalue()
-    return img_bytes
+    is_success, buffer = cv2.imencode(".png", image)
+    return buffer.tobytes()
