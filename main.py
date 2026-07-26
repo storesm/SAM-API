@@ -1,175 +1,142 @@
-import base64
-from http.client import HTTPException
-from io import BytesIO
-import io
 import json
-from pathlib import Path
+import logging
+import os
 import re
-import time
-from typing import Union
 import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
-import cv2
-from fastapi import FastAPI, Form, Response, UploadFile, File
-from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, StreamingResponse
-import numpy as np
-from models.api_models import Item, SAMInput
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import ValidationError
 
-import matplotlib.pyplot as plt
-from preprocessing import decode_image, decode_inputs, format_inputs_to_sam
-from sam.sam import sam_execution
-from sam.utils.plotting import show_image, show_raw_image
+from imaging import decode_image, encode_mask_png, encode_png, overlay_mask, write_dicom
+from models import SegmentationJob, SegmentationRequest
+from segmentation import predict_mask
 
-import pydicom
-from pydicom.dataset import Dataset, FileDataset
-from pydicom.uid import ExplicitVRLittleEndian
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-app = FastAPI()
+RESULTS_DIR = Path(os.getenv("SAM_RESULTS_DIR", "results"))
+ALLOWED_ORIGINS = os.getenv(
+    "SAM_ALLOWED_ORIGINS", "http://localhost,http://localhost:3000"
+).split(",")
+JOB_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
+SOURCE_NAME = "source.png"
+MASK_NAME = "mask.png"
+OVERLAY_NAME = "overlay.png"
+DICOM_NAME = "segmentation.dcm"
+REQUEST_NAME = "request.json"
 
-# Configuración de los orígenes permitidos para CORS
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("results stored under %s", RESULTS_DIR.resolve())
+    yield
+
+
+app = FastAPI(title="SAM Segmentation API", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 
-@app.post("/segment_input_image/")
-async def segment_input_image(
-    file: UploadFile = File(...),
-    sam_input: str = Form(...),
-):
-    sam_input = json.loads(sam_input)
+def artifact_path(job_id: str, filename: str) -> Path:
+    """Resolve a stored artifact, rejecting ids that could escape the results directory."""
+    if not JOB_ID_PATTERN.fullmatch(job_id):
+        raise HTTPException(status_code=400, detail="malformed job id")
 
-    image = await decode_image(file)
-    print("imagen shape: ", image.shape)
+    path = RESULTS_DIR / job_id / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"no {filename} stored for job {job_id}")
 
-    # Variable with the actual date and time
-    now = time.time()
+    return path
 
-    # Decode the inputs
-    positive_points, negative_points, input_box = decode_inputs(sam_input)
 
-    # Format the inputs to be used in the SAM model
-    input_points, input_labels = format_inputs_to_sam(positive_points, negative_points)
+@app.get("/health_check/")
+async def health_check():
+    return {"status": "ok"}
 
-    # Execute the SAM model
-    masks = sam_execution(image, input_box, input_points, input_labels, verbose=False)
 
-    overlaid_image = overlay_mask(image, masks)
+@app.post("/segment_input_image/", response_model=SegmentationJob)
+async def segment_input_image(file: UploadFile = File(...), sam_input: str = Form(...)):
+    try:
+        request = SegmentationRequest.model_validate_json(sam_input)
+    except ValidationError as error:
+        raise HTTPException(status_code=422, detail=json.loads(error.json())) from error
 
-    # Codificar la imagen resultante en formato PNG
-    img_bytes = encode_image(overlaid_image)
+    try:
+        image = decode_image(await file.read())
+    except ValueError as error:
+        raise HTTPException(status_code=415, detail=str(error)) from error
 
-    # Save the inputs in the server
-    inputs_path = f"log/inputs_{now}.json"
-    with open(inputs_path, "w") as f:
-        json.dump(sam_input, f)
+    try:
+        mask = predict_mask(image, request)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
 
-    # Save the image in the server
-    image_path = f"log/image_{now}.png"
-    cv2.imwrite(image_path, image)
+    overlay = overlay_mask(image, mask)
 
-    # Save the masked image in the server
-    overlaid_image_path = f"log/overlaid_image_{now}.png"
-    cv2.imwrite(overlaid_image_path, overlaid_image)
+    job_id = uuid.uuid4().hex
+    job_dir = RESULTS_DIR / job_id
+    job_dir.mkdir(parents=True)
 
-    # Save the ndarray of masks in the server
-    masks_path = f"log/masks_matrix{now}.npy"
-    np.save(masks_path, masks)
+    job = SegmentationJob(
+        job_id=job_id,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        model_type=request.model_type,
+        image_width=image.shape[1],
+        image_height=image.shape[0],
+        prompt_counts={
+            "positive_points": len(request.positive_points),
+            "negative_points": len(request.negative_points),
+            "boxes": len(request.boxes),
+        },
+    )
 
-    # Utiliza la función para guardar el archivo DICOM
-    output_dicom_path = f"log/output_{now}.dcm"
-    save_dicom_from_image(overlaid_image, output_dicom_path)
+    # Everything that produced the result is kept so a segmentation can be audited or replayed
+    (job_dir / REQUEST_NAME).write_text(
+        json.dumps({"job": job.model_dump(), "prompt": request.model_dump()}, indent=2)
+    )
+    (job_dir / SOURCE_NAME).write_bytes(encode_png(image))
+    (job_dir / MASK_NAME).write_bytes(encode_mask_png(mask))
+    (job_dir / OVERLAY_NAME).write_bytes(encode_png(overlay))
+    write_dicom(overlay, job_id, job_dir / DICOM_NAME)
 
-    # Guardar la imagen PNG en un archivo temporal
-    segmented_image_path = f"log/segmented_image_{now}.png"
-    with open(segmented_image_path, "wb") as f:
-        f.write(img_bytes)
+    logger.info("job %s stored", job_id)
+    return job
 
-    # Devolver solo el timestamp
-    return {"timestamp": now}
 
-@app.get("/get_segmented_image/{timestamp}")
-async def get_segmented_image(timestamp: float):
-    segmented_image_path = f"log/segmented_image_{timestamp}.png"
-    if Path(segmented_image_path).exists():
-        return FileResponse(segmented_image_path, media_type="image/png", filename=f"segmented_image_{timestamp}.png")
-    else:
-        raise HTTPException(status_code=404, detail="Segmented image not found")
+@app.get("/get_segmented_image/{job_id}")
+async def get_segmented_image(job_id: str):
+    return FileResponse(
+        artifact_path(job_id, OVERLAY_NAME),
+        media_type="image/png",
+        filename=f"overlay_{job_id}.png",
+    )
 
-@app.get("/get_dicom_image/{timestamp}")
-async def get_dicom_image(timestamp: float):
-    output_dicom_path = f"log/output_{timestamp}.dcm"
-    if Path(output_dicom_path).exists():
-        return FileResponse(output_dicom_path, media_type="application/dicom", filename=f"output_{timestamp}.dcm")
-    else:
-        raise HTTPException(status_code=404, detail="DICOM file not found")
 
-def save_dicom_from_image(image_array, output_path):
-    # Verificar si la imagen es a color
-    if len(image_array.shape) == 3 and image_array.shape[2] == 3:
-        # Convertir la imagen a RGB
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
-    
-    # Escalar los píxeles para que estén en el rango adecuado para DICOM
-    image_array = cv2.normalize(image_array, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+@app.get("/get_mask_image/{job_id}")
+async def get_mask_image(job_id: str):
+    return FileResponse(
+        artifact_path(job_id, MASK_NAME),
+        media_type="image/png",
+        filename=f"mask_{job_id}.png",
+    )
 
-    # Crear un nuevo conjunto de datos DICOM
-    file_meta = Dataset()
-    file_meta.MediaStorageSOPClassUID = pydicom.uid.SecondaryCaptureImageStorage
-    file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
-    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
 
-    ds = FileDataset(output_path, {}, file_meta=file_meta, preamble=b"\0" * 128)
-
-    # Información del paciente y del estudio
-    ds.PatientName = "John Doe"
-    ds.PatientID = "123456"
-    ds.StudyInstanceUID = pydicom.uid.generate_uid()
-    ds.SeriesInstanceUID = pydicom.uid.generate_uid()
-    ds.SOPInstanceUID = pydicom.uid.generate_uid()
-    ds.Modality = "OT"  # Other
-    ds.StudyDate = time.strftime("%Y%m%d")
-    ds.StudyTime = time.strftime("%H%M%S")
-    ds.ContentDate = time.strftime("%Y%m%d")
-    ds.ContentTime = time.strftime("%H%M%S")
-
-    # Establecer dimensiones de la imagen
-    ds.SamplesPerPixel = 3
-    ds.PhotometricInterpretation = "RGB"
-    ds.Rows, ds.Columns, _ = image_array.shape
-    ds.BitsAllocated = 8
-    ds.BitsStored = 8
-    ds.HighBit = 7
-    ds.PixelRepresentation = 0
-    ds.PlanarConfiguration = 0
-    ds.PixelData = image_array.tobytes()
-
-    # Guardar el archivo DICOM
-    ds.save_as(output_path)
-
-def overlay_mask(image, masks):
-    overlaid_image = np.copy(image)
-    if masks is not None:
-        # Crear una imagen binaria de la máscara
-        mask_image = np.uint8(masks[0] * 255)
-        # Crear una imagen de color rojo para la máscara
-        red_image = np.zeros_like(image)
-        red_image[:, :] = [0, 0, 255]
-        # Superponer la imagen roja sobre la imagen original donde la máscara no es cero
-        overlaid_image = np.where(mask_image[:, :, None] != 0, red_image, overlaid_image)
-    return overlaid_image
-
-def encode_image(image):
-    is_success, buffer = cv2.imencode(".png", image)
-    return buffer.tobytes()
+@app.get("/get_dicom_image/{job_id}")
+async def get_dicom_image(job_id: str):
+    return FileResponse(
+        artifact_path(job_id, DICOM_NAME),
+        media_type="application/dicom",
+        filename=f"segmentation_{job_id}.dcm",
+    )

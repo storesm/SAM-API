@@ -1,137 +1,147 @@
-# Medical Image Segmentation API
+# SAM Segmentation API
 
-## Overview
-This project implements a RESTful API for medical image segmentation, using the **Segment Anything Model (SAM)** developed by Meta. The API is built with **FastAPI** and is designed to integrate with the **OHIF** (Open Health Imaging Foundation) medical imaging viewer. It allows healthcare professionals to upload medical images, perform image segmentation, and retrieve results in DICOM or PNG format.
+REST API that segments medical images with Meta's **Segment Anything Model (SAM)**. It is the
+inference backend for the [SAM-OHIF](https://github.com/storesm/SAM-OHIF) viewer extension: the
+viewer sends a captured image plus the marks a clinician drew on it, and the API returns the mask
+as a PNG overlay and as a DICOM secondary capture.
 
-The API is designed to run in a secure, internal environment within healthcare institutions, ensuring compliance with medical data privacy regulations.
+The service is meant to run inside the hospital network. Images never leave the institution, which
+is what keeps the workflow compatible with medical data protection rules.
 
-## Key Features
-- **FastAPI-based RESTful API** for handling segmentation requests.
-- **SAM (Segment Anything Model)** for automatic image segmentation.
-- Support for **DICOM** and **PNG** formats.
-- **Internal deployment** to ensure data privacy within the institution's network.
-- **Interoperability** with the OHIF viewer, providing a seamless integration for medical professionals.
+## Design
 
-## Technology Stack
-- **FastAPI**: Framework used for creating the API.
-- **SAM (Segment Anything Model)**: Model used for medical image segmentation.
-- **Python**: Programming language used for backend development.
-- **Docker**: For containerization and easy deployment.
-  
-## API Endpoints
+The viewer posts an image and the marks drawn on it to `/segment_input_image/`, FastAPI runs SAM
+against a checkpoint held in memory, and the viewer then fetches the overlay, the mask or the DICOM
+file for that job.
 
-### 1. `/segment_input_image/` (POST)
-- **Description**: Receives an image and segmentation parameters, performs the segmentation, and returns a timestamp for tracking the request.
-- **Request**:
-  - **Image file**: Medical image in supported formats (e.g., PNG, JPEG).
-  - **JSON**: Parameters such as positive/negative points and rectangles for guiding the segmentation process.
-- **Response**:
-  - JSON containing a `timestamp` to track the segmentation request.
+Requests are identified by a **job id**, a random UUID minted per segmentation. Each job gets a
+directory under `results/` holding everything needed to audit or replay it:
 
-### 2. `/get_segmented_image/{timestamp}` (GET)
-- **Description**: Retrieves the segmented image in PNG format using the `timestamp`.
-- **Parameters**:
-  - `timestamp`: Identifier for the segmentation process.
-- **Response**:
-  - PNG file of the segmented image.
+```
+results/<job_id>/
+  request.json      the prompts and job metadata, including the creation timestamp
+  source.png        the image as received
+  mask.png          the binary mask
+  overlay.png       the mask blended over the image
+  segmentation.dcm  DICOM secondary capture of the overlay
+```
 
-### 3. `/get_dicom_image/{timestamp}` (GET)
-- **Description**: Retrieves the segmented image in DICOM format.
-- **Parameters**:
-  - `timestamp`: Identifier for the segmentation process.
-- **Response**:
-  - DICOM file containing the segmented image.
+A UUID keeps identity separate from timing: two requests in the same instant cannot collide, the id
+survives a URL path unambiguously, and it is not guessable. The creation time is metadata, recorded
+in `request.json`.
 
-### 4. `/health_check/` (GET)
-- **Description**: API health check, confirming the service is running.
-- **Response**:
-  - JSON with the API's status.
+## Endpoints
 
-## Architecture
-The API follows a **client-server architecture**, where the client (OHIF viewer) sends requests to the API to perform segmentation. The API processes the images using the SAM model and returns the segmented results.
+### `POST /segment_input_image/`
 
-- **OHIF Viewer**: Frontend viewer for interacting with the images.
-- **FastAPI**: Backend framework for handling requests.
-- **SAM Model**: Performs the image segmentation.
-- **Docker**: Ensures easy deployment across various environments.
+Multipart form with two fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `file` | file | The image to segment (PNG, JPEG, anything OpenCV decodes) |
+| `sam_input` | string | JSON prompt, see below |
+
+```json
+{
+  "model_type": "vit_h",
+  "positive_points": [{ "x": 250, "y": 300 }],
+  "negative_points": [{ "x": 750, "y": 300 }],
+  "boxes": [{ "start_x": 100, "start_y": 60, "width": 400, "height": 240 }]
+}
+```
+
+Coordinates are pixels of the uploaded image. Boxes accept a negative `width` or `height`, so a
+drag in any direction works. At least one point or one box is required.
+
+Returns the job descriptor:
+
+```json
+{
+  "job_id": "ffb57262d6df493a961499358bef3834",
+  "created_at": "2026-07-26T15:06:29.971867+00:00",
+  "model_type": "vit_h",
+  "image_width": 1800,
+  "image_height": 1200,
+  "prompt_counts": { "positive_points": 1, "negative_points": 0, "boxes": 1 }
+}
+```
+
+| Status | Meaning |
+| --- | --- |
+| 415 | The uploaded file could not be decoded as an image |
+| 422 | The prompt is malformed, or nothing usable survived clipping to the image |
+
+### `GET /get_segmented_image/{job_id}`
+
+The mask blended over the image and outlined, as PNG.
+
+### `GET /get_mask_image/{job_id}`
+
+The raw binary mask as PNG, for callers that want to composite it themselves.
+
+### `GET /get_dicom_image/{job_id}`
+
+DICOM secondary capture of the overlay. No patient identity is attached: the source is an uploaded
+rendering that carries none, so `PatientName` is `ANONYMOUS` and `PatientIdentityRemoved` is `YES`.
+
+### `GET /health_check/`
+
+`{"status": "ok"}` once the service is up.
+
+Malformed job ids are rejected with 400 before anything touches the filesystem; unknown ones give
+404.
 
 ## Installation
 
-### Prerequisites
-- **Docker**: Ensure Docker is installed on your system.
-- **Python 3.8+**: Required to run the API.
-- **Pip**: Python package manager.
+```bash
+git clone https://github.com/storesm/SAM-API.git
+cd SAM-API
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-### Steps to Install and Run
+Download a SAM checkpoint from the
+[official repository](https://github.com/facebookresearch/segment-anything#model-checkpoints) and
+put it where `SAM_CHECKPOINT` points:
 
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/Sergiotm13/SAM-API.git
-   cd SAM-API
-    ```
-   
-2. **Create a Virtual Environment (optional but recommended):**
-   ```bash
-   python3 -m venv env
-   source env/bin/activate
-   ```
+```bash
+mkdir -p sam_models
+curl -L -o sam_models/sam_vit_h_4b8939.pth \
+  https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth
+```
 
-3. **Install Dependencies:**
+## Running
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
-4. **Run the API:**
+Interactive documentation is generated at `/docs`.
 
-   ```bash
-   uvicorn main
-   ```
+## Configuration
 
-## Data Models
-The API uses several data models to validate and manage incoming data for the segmentation process:
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SAM_CHECKPOINT` | `sam_models/sam_vit_h_4b8939.pth` | Path to the model weights |
+| `SAM_MODEL_TYPE` | `vit_h` | Architecture matching the checkpoint |
+| `SAM_RESULTS_DIR` | `results` | Where job directories are written |
+| `SAM_ALLOWED_ORIGINS` | `http://localhost,http://localhost:3000` | Comma separated CORS origins |
 
-1. **SAMInput**:
-   - This model handles the primary inputs required for a segmentation request.
-   - **Attributes**:
-     - `model`: Specifies the model to be used for segmentation (e.g., SAM).
-     - `rectangles`: A list of `RectInput` objects defining areas for segmentation.
-     - `positive_points`: A list of `PointInput` objects marking areas of interest.
-     - `negative_points`: A list of `PointInput` objects marking areas to exclude from segmentation.
+The checkpoint is loaded once and kept resident. CUDA is used when available; on CPU a single
+segmentation of a 1800×1200 image takes roughly 45 seconds, almost all of it computing the image
+embedding.
 
-2. **RectInput**:
-   - Defines rectangular areas within the image to guide the segmentation model.
-   - **Attributes**:
-     - `startX`: X-coordinate of the rectangle's top-left corner.
-     - `startY`: Y-coordinate of the rectangle's top-left corner.
-     - `width`: Width of the rectangle.
-     - `height`: Height of the rectangle.
+## Tests
 
-3. **PointInput**:
-   - Specifies a single point within the image.
-   - **Attributes**:
-     - `x`: X-coordinate of the point.
-     - `y`: Y-coordinate of the point.
+```bash
+python test_segmentation.py
+```
 
-Each of these models is validated upon request submission, ensuring the API processes well-structured data. 
-
-## Security and Privacy
-This API is intended for use in secure healthcare environments, ensuring compliance with data protection regulations:
-- **CORS Middleware**: Configured to restrict API access to trusted origins. By default, it allows access from `http://localhost` and `http://localhost:3000` to facilitate local testing and development.
-- **Data Handling**: Data is stored with timestamp identifiers for ease of tracking, retrieval, and ensuring the traceability of each segmentation process.
-
-## Future Enhancements
-Future updates to the API may include:
-- **Support for additional segmentation models**: Expand model options to enhance flexibility.
-- **Enhanced parameter configurations**: Allow users to define more specific options for tailored segmentation.
-- **Monitoring and logging**: Implement comprehensive logging for auditing purposes, which is crucial in healthcare applications.
-
-## Contributions
-Contributions are welcome to improve and expand the project. To contribute:
-1. Fork the repository.
-2. Create a feature branch.
-3. Make your changes and submit a pull request with a description of the modifications.
+Covers the prompt geometry, the overlay blending, the PNG round trip and the DICOM output. It needs
+neither the checkpoint nor a GPU. For a manual end to end check, post `images/truck.jpg` with a
+point on a wheel and confirm the returned overlay tints the tyre.
 
 ## License
-This project is distributed under the MIT License. For more details, please see the [LICENSE](LICENSE) file.
 
+MIT. See [LICENSE](LICENSE).

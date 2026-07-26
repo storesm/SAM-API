@@ -1,6 +1,6 @@
-sam_vit_h_4b8939.pth
-masks_*
-log/*
+sam_models/
+*.pth
+results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
